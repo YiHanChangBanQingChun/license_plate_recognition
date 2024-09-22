@@ -214,27 +214,15 @@ def detect_license_plate(img, num, color_ranges=None):
     return ROIs, bboxes
 
 def segment_characters(plate_img, num, templates=None):
-    """
-    分割车牌字符并保存每个字符的图像。
-    
-    参数:
-    - plate_img: 截取的车牌图像
-    - num: 图像编号，用于保存文件
-    - templates: 字符模板字典（可选）
-    
-    返回:
-    - refined_characters: 分割出的字符图像列表
-    - plate_text: 识别出的车牌文本
-    """
-    # 转灰度
+    # Convert to grayscale
     gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
     save_and_show('Plate Gray', gray, f'{num}_plate_gray.png')
 
-    # 二值化
+    # Binarization
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY_INV)
     save_and_show('Plate Binary', binary, f'{num}_plate_binary.png')
 
-    # 去除最边缘的一部分
+    # Remove margins
     margin_size = 10
     binary[:margin_size, :] = 0
     binary[-margin_size:, :] = 0
@@ -242,45 +230,33 @@ def segment_characters(plate_img, num, templates=None):
     binary[:, -margin_size:] = 0
     save_and_show('Binary after Margin Removal', binary, f'{num}_binary_margin_removed.png')
 
-    # 形态学操作，使用开操作去除噪点
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))  # 使用较大的核
+    # Morphological operations to clean up the image
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
     save_and_show('Opening Image', opening, f'{num}_opening.png')
 
-    # 膨胀操作，连接字符内的断裂
-    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))  # 增加核大小
-    dilated = cv2.dilate(opening, kernel_dilate, iterations=2)
+    # Dilation to connect characters
+    dilated = cv2.dilate(opening, kernel, iterations=2)
     save_and_show('Dilated Image', dilated, f'{num}_dilated.png')
 
-    # 腐蚀操作，防止字符之间连在一起
-    kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))  # 可以保留
-    eroded = cv2.erode(dilated, kernel_erode, iterations=2)  # 减少迭代次数
-    save_and_show('Eroded Image', eroded, f'{num}_eroded.png')
+    # Connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dilated, connectivity=8)
 
-
-    # 连通域检测
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded, connectivity=8)
-
-    # 获取车牌图像尺寸
-    plate_height, plate_width = plate_img.shape[:2]
-    plate_area = plate_width * plate_height
-
-    # 动态计算面积阈值
-    min_area = plate_area * 0.02  # 2%
-    max_area = plate_area * 0.06  # 6%
-
-    # 筛选字符区域
     characters = []
     char_img = plate_img.copy()
+
+    # Dynamic area threshold
+    plate_height, plate_width = plate_img.shape[:2]
+    min_area = plate_width * plate_height * 0.02
+    max_area = plate_width * plate_height * 0.06
+
     for i in range(1, num_labels):
         x, y, w, h, area = stats[i]
         aspect_ratio = w / h
-        # 动态调整字符筛选参数
-        if 0.3 < aspect_ratio < 0.8 and min_area < area < max_area:
+        if min_area < area < max_area and 0.3 < aspect_ratio < 0.8:
             cv2.rectangle(char_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            char = binary[y:y+h, x:x+w]
+            char = binary[y:y + h, x:x + w]
             characters.append((x, char))
-            # 保存字符图像
             cv2.imwrite(os.path.join(output_dir, f'{num}_char_{i}.png'), char)
 
     save_and_show('Detected Characters', char_img, f'{num}_detected_characters.png')
@@ -289,56 +265,40 @@ def segment_characters(plate_img, num, templates=None):
         print("未检测到字符。")
         return [], ""
 
-    # 根据x坐标排序字符，确保顺序正确
+    # Sort characters by x-coordinate
     characters = sorted(characters, key=lambda item: item[0])
-    sorted_characters = [char for (x, char) in characters]
+    sorted_characters = [char for (_, char) in characters]
 
-    # 检查是否有合并的字符区域，根据宽度是否异常大来决定是否需要分割
     refined_characters = []
     for i, char in enumerate(sorted_characters):
         char_h, char_w = char.shape
-        if char_w > char_h * 1.0:  # 如果字符宽度大于高度，可能包含多个字符
-            # 使用垂直投影分割字符
+        if char_w > char_h:  # Check for possible merged characters
             sub_chars = vertical_projection_split(char, min_gap_ratio=0.5)
-            if sub_chars:
-                for j, sub_char in enumerate(sub_chars):
-                    # 调整子字符图像尺寸
-                    sub_char_resized = cv2.resize(sub_char, (20, 40), interpolation=cv2.INTER_AREA)
-                    refined_characters.append(sub_char_resized)
-                    cv2.imwrite(os.path.join(output_dir, f'{num}_char_split_{i}_{j}.png'), sub_char_resized)
+            for j, sub_char in enumerate(sub_chars):
+                sub_char_resized = cv2.resize(sub_char, (20, 40), interpolation=cv2.INTER_AREA)
+                refined_characters.append(sub_char_resized)
+                cv2.imwrite(os.path.join(output_dir, f'{num}_char_split_{i}_{j}.png'), sub_char_resized)
         else:
-            # 调整字符图像尺寸
             char_resized = cv2.resize(char, (20, 40), interpolation=cv2.INTER_AREA)
             refined_characters.append(char_resized)
             cv2.imwrite(os.path.join(output_dir, f'{num}_char_resized_{i}.png'), char_resized)
 
-    # 可视化细化后的字符
-    if refined_characters:
-        for idx, sub_char in enumerate(refined_characters):
-            cv2.imshow(f'Character {idx}', sub_char)
-            cv2.imwrite(os.path.join(output_dir, f'{num}_refined_char_{idx}.png'), sub_char)
-
     save_and_show('Refined Characters', char_img, f'{num}_refined_characters.png')
 
-    # 字符识别（可选）
+    # Character recognition
     plate_text = ""
     if templates:
         for idx, char in enumerate(refined_characters):
             recognized_char = recognize_character(char, templates)
-            if recognized_char:
-                plate_text += recognized_char
-            else:
-                plate_text += '?'
-            # 可视化识别结果
-            cv2.putText(char_img, recognized_char if recognized_char else '?', (10, 30 + idx*30), 
+            plate_text += recognized_char if recognized_char else '?'
+            cv2.putText(char_img, recognized_char if recognized_char else '?', (10, 30 + idx * 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-    # 保存识别结果图像
-    if templates:
-        cv2.imwrite(os.path.join(output_dir, f'{num}_recognized_plate.png'), char_img)
-        save_and_show('Recognized Plate Text', char_img, f'{num}_recognized_plate.png')
+    cv2.imwrite(os.path.join(output_dir, f'{num}_recognized_plate.png'), char_img)
+    save_and_show('Recognized Plate Text', char_img, f'{num}_recognized_plate.png')
 
     return refined_characters, plate_text
+
 
 def main():
     """
