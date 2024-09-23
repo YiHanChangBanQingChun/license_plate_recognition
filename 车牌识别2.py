@@ -21,24 +21,37 @@ def save_and_show(title, image, filename=None):
     if filename:
         cv2.imwrite(os.path.join(output_dir, filename), image)
 
-def resize_plate(plate_img, target_width=1000):
+def order_points(pts):
     """
-    调整车牌图像的尺寸，使其横向分辨率为target_width，同时保持纵横比。
+    将四个点按照顺时针顺序排列: top-left, top-right, bottom-right, bottom-left
+    """
+    rect = np.zeros((4, 2), dtype="float32")
+
+    # the top-left point will have the smallest sum,
+    # the bottom-right point will have the largest sum
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+
+    # the top-right point will have the smallest difference,
+    # the bottom-left will have the largest difference
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+
+    return rect
+
+def load_char_templates(template_dir, size=(20, 40)):
+    """
+    加载字符模板并调整其大小。
 
     参数:
-    - plate_img: 原始车牌图像
-    - target_width: 目标宽度（默认1000像素）
+    - template_dir: 模板文件夹路径
+    - size: 调整后的模板大小（默认20x40像素）
 
     返回:
-    - resized_plate: 调整后的车牌图像
+    - templates: 字符模板字典
     """
-    original_height, original_width = plate_img.shape[:2]
-    aspect_ratio = original_height / original_width
-    target_height = int(target_width * aspect_ratio)
-    resized_plate = cv2.resize(plate_img, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-    return resized_plate
-
-def load_char_templates(template_dir, size=(20, 20)):
     templates = {}
     for filename in os.listdir(template_dir):
         if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
@@ -201,19 +214,51 @@ def detect_license_plate(img, num, color_ranges=None):
     for idx, plate in enumerate(plates):
         # 进行透视变换
         pts = plate.reshape(4, 2)
-        dst = np.array([[0, 0], [1000, 0], [1000, 200], [0, 200]], dtype='float32')  # 目标矩形的四个点
-        M = cv2.getPerspectiveTransform(pts.astype(np.float32), dst)
-        warped = cv2.warpPerspective(img, M, (1000, 200))
+        rect = order_points(pts)
+        (tl, tr, br, bl) = rect
 
-        ROIs.append(warped)
-        bboxes.append(pts)  # 存储原始顶点
+        # 计算新的宽度和高度
+        widthA = np.linalg.norm(br - bl)
+        widthB = np.linalg.norm(tr - tl)
+        maxWidth = max(int(widthA), int(widthB))
 
-        # 保存每个车牌图像
-        cv2.imwrite(os.path.join(output_dir, f'{num}_plate_{idx}.png'), warped)
+        heightA = np.linalg.norm(tr - br)
+        heightB = np.linalg.norm(tl - bl)
+        maxHeight = max(int(heightA), int(heightB))
+
+        dst = np.array([
+            [0, 0],
+            [maxWidth - 1, 0],
+            [maxWidth - 1, maxHeight - 1],
+            [0, maxHeight - 1]], dtype="float32")
+
+        try:
+            M = cv2.getPerspectiveTransform(rect, dst)
+            warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
+            ROIs.append(warped)
+            bboxes.append(plate)  # 保存原始顶点
+
+            # 保存每个车牌图像
+            cv2.imwrite(os.path.join(output_dir, f'{num}_plate_{idx}.png'), warped)
+        except Exception as e:
+            print(f"透视变换失败: {e}")
+            continue
 
     return ROIs, bboxes
 
 def segment_characters(plate_img, num, templates=None):
+    """
+    分割车牌中的字符并进行识别。
+
+    参数:
+    - plate_img: 车牌图像
+    - num: 图像编号，用于保存文件
+    - templates: 字符模板字典
+
+    返回:
+    - refined_characters: 识别后的字符列表
+    - plate_text: 识别出的车牌文本
+    """
     # Convert to grayscale
     gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
     save_and_show('Plate Gray', gray, f'{num}_plate_gray.png')
@@ -257,6 +302,7 @@ def segment_characters(plate_img, num, templates=None):
             cv2.rectangle(char_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
             char = binary[y:y + h, x:x + w]
             characters.append((x, char))
+            # 保存原始字符图像
             cv2.imwrite(os.path.join(output_dir, f'{num}_char_{i}.png'), char)
 
     save_and_show('Detected Characters', char_img, f'{num}_detected_characters.png')
@@ -272,16 +318,24 @@ def segment_characters(plate_img, num, templates=None):
     refined_characters = []
     for i, char in enumerate(sorted_characters):
         char_h, char_w = char.shape
-        if char_w > char_h:  # Check for possible merged characters
+        if char_w > char_h:  # 检查是否有合并字符
             sub_chars = vertical_projection_split(char, min_gap_ratio=0.5)
             for j, sub_char in enumerate(sub_chars):
-                sub_char_resized = cv2.resize(sub_char, (20, 40), interpolation=cv2.INTER_AREA)
-                refined_characters.append(sub_char_resized)
-                cv2.imwrite(os.path.join(output_dir, f'{num}_char_split_{i}_{j}.png'), sub_char_resized)
+                try:
+                    # 保存原始子字符图像
+                    cv2.imwrite(os.path.join(output_dir, f'{num}_char_split_{i}_{j}.png'), sub_char)
+                    # 调整大小用于识别
+                    sub_char_resized = cv2.resize(sub_char, (20, 40), interpolation=cv2.INTER_AREA)
+                    refined_characters.append(sub_char_resized)
+                except Exception as e:
+                    print(f"调整子字符大小时出错: {e}")
         else:
-            char_resized = cv2.resize(char, (20, 40), interpolation=cv2.INTER_AREA)
-            refined_characters.append(char_resized)
-            cv2.imwrite(os.path.join(output_dir, f'{num}_char_resized_{i}.png'), char_resized)
+            try:
+                # 调整大小用于识别
+                char_resized = cv2.resize(char, (20, 40), interpolation=cv2.INTER_AREA)
+                refined_characters.append(char_resized)
+            except Exception as e:
+                print(f"调整字符大小时出错: {e}")
 
     save_and_show('Refined Characters', char_img, f'{num}_refined_characters.png')
 
@@ -291,14 +345,15 @@ def segment_characters(plate_img, num, templates=None):
         for idx, char in enumerate(refined_characters):
             recognized_char = recognize_character(char, templates)
             plate_text += recognized_char if recognized_char else '?'
+            # 在车牌图像上标注识别出的字符
             cv2.putText(char_img, recognized_char if recognized_char else '?', (10, 30 + idx * 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
+    # 保存和显示识别结果
     cv2.imwrite(os.path.join(output_dir, f'{num}_recognized_plate.png'), char_img)
     save_and_show('Recognized Plate Text', char_img, f'{num}_recognized_plate.png')
 
     return refined_characters, plate_text
-
 
 def main():
     """
