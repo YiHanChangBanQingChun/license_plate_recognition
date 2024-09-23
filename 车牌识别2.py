@@ -1,426 +1,184 @@
 import cv2
 import numpy as np
 import os
-import functools
 
-# 创建输出文件夹
-output_dir = 'output'
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
+def preprocess_character(char_img):
+    # 将字符图像转换为灰度图像
+    gray = cv2.cvtColor(char_img, cv2.COLOR_BGR2GRAY)
+    # 使用大津算法进行二值化
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # 调整图像大小为20x20
+    resized = cv2.resize(binary, (20, 40), interpolation=cv2.INTER_AREA)
+    return resized
 
-def save_and_show(title, image, filename=None):
-    """
-    保存和显示图像。
-
-    参数:
-    - title: 窗口标题
-    - image: 要显示的图像
-    - filename: 要保存的文件名（可选）
-    """
-    cv2.imshow(title, image)
-    if filename:
-        cv2.imwrite(os.path.join(output_dir, filename), image)
-
-def order_points(pts):
-    """
-    将四个点按照顺时针顺序排列: top-left, top-right, bottom-right, bottom-left
-    """
-    rect = np.zeros((4, 2), dtype="float32")
-
-    # the top-left point will have the smallest sum,
-    # the bottom-right point will have the largest sum
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-
-    # the top-right point will have the smallest difference,
-    # the bottom-left will have the largest difference
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-
-    return rect
-
-def load_char_templates(template_dir, size=(20, 40)):
-    """
-    加载字符模板并调整其大小。
-
-    参数:
-    - template_dir: 模板文件夹路径
-    - size: 调整后的模板大小（默认20x40像素）
-
-    返回:
-    - templates: 字符模板字典
-    """
+def load_templates(template_folder):
     templates = {}
-    for filename in os.listdir(template_dir):
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-            char = os.path.splitext(filename)[0]
-            tmpl_path = os.path.join(template_dir, filename)
-            if not os.path.isfile(tmpl_path):
-                print(f"模板文件不存在: {tmpl_path}")
+    # 遍历模板文件夹中的所有PNG文件
+    for filename in os.listdir(template_folder):
+        if filename.endswith('.png'):
+            label = os.path.splitext(filename)[0]  # 使用文件名作为标签
+            template_path = os.path.join(template_folder, filename)
+            template_img = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+            if template_img is None:
+                print(f"Warning: Failed to load image {template_path}")
                 continue
-
-            tmpl = cv2.imread(tmpl_path, cv2.IMREAD_GRAYSCALE)
-            if tmpl is None:
-                print(f"无法读取模板文件: {tmpl_path}")
-                continue
-
-            _, tmpl_bin = cv2.threshold(tmpl, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY_INV)
-            try:
-                tmpl_resized = cv2.resize(tmpl_bin, size, interpolation=cv2.INTER_AREA)
-                templates[char] = tmpl_resized
-                print(f"模板已加载: {char}")
-            except Exception as e:
-                print(f"调整模板大小时出错: {tmpl_path}, 错误: {e}")
+            # 使用大津算法进行二值化
+            _, template_binary = cv2.threshold(template_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            # 调整图像大小为20x20
+            resized_template = cv2.resize(template_binary, (20, 40), interpolation=cv2.INTER_AREA)
+            templates[label] = resized_template
     return templates
 
-def vertical_projection_split(char, min_gap_ratio=0.4):
-    """
-    使用垂直投影分割字符。
-
-    参数:
-    - char: 单个字符的二值图像
-    - min_gap_ratio: 空隙的最小比例，用于确定分割阈值
-
-    返回:
-    - sub_chars: 分割后的子字符列表
-    """
-    vertical_sum = np.sum(char, axis=0) / 255
-    threshold_val = np.max(vertical_sum) * min_gap_ratio
-    split_points = []
-    in_char = False
-    start = 0
-    for idx, val in enumerate(vertical_sum):
-        if val > threshold_val and not in_char:
-            in_char = True
-            start = idx
-        elif val <= threshold_val and in_char:
-            in_char = False
-            end = idx
-            split_points.append((start, end))
-    if in_char:
-        split_points.append((start, len(vertical_sum) - 1))
-
-    sub_chars = []
-    for (start, end) in split_points:
-        margin = 2  # 边缘扩展，避免字符边缘缺失
-        start = max(start - margin, 0)
-        end = min(end + margin, char.shape[1])
-        sub_char = char[:, start:end]
-        if sub_char.shape[1] > 5 and sub_char.shape[0] > 10:
-            sub_chars.append(sub_char)
-    return sub_chars
-
-def recognize_character(char_img, templates):
-    """
-    识别单个字符。
-
-    参数:
-    - char_img: 单个字符的二值图像
-    - templates: 字符模板字典
-
-    返回:
-    - best_char: 识别出的字符
-    """
+def match_character(char_img, templates):
     best_score = -1
-    best_char = None
-    for char, tmpl in templates.items():
-        # 调整字符图像和模板尺寸一致
-        try:
-            tmpl_resized = cv2.resize(tmpl, (char_img.shape[1], char_img.shape[0]), interpolation=cv2.INTER_AREA)
-        except Exception as e:
-            print(f"调整模板大小时出错: 字符 {char}, 错误: {e}")
-            continue
-        res = cv2.matchTemplate(char_img, tmpl_resized, cv2.TM_CCOEFF_NORMED)
-        _, score, _, _ = cv2.minMaxLoc(res)
+    best_label = None
+    # 遍历所有模板，找到匹配度最高的模板
+    for label, template in templates.items():
+        result = cv2.matchTemplate(char_img, template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, _ = cv2.minMaxLoc(result)
         if score > best_score:
             best_score = score
-            best_char = char
-    return best_char
+            best_label = label
+    return best_label
 
-def detect_license_plate(img, num, color_ranges=None):
-    """
-    检测车牌位置并返回车牌区域。
+def save_image(image, output_folder, img_name, suffix):
+    base, ext = os.path.splitext(img_name)
+    save_path = os.path.join(output_folder, f"{base}_{suffix}{ext}")
+    cv2.imwrite(save_path, image)
+    print(f"Saved {save_path}")
 
-    参数:
-    - img: 原始图像
-    - num: 图像编号，用于保存文件
-    - color_ranges: 颜色范围字典
+def process_image(img_path, templates, output_folder):
+    img_name = os.path.basename(img_path)
+    img = cv2.imread(img_path, 1)
 
-    返回:
-    - ROIs: 截取并调整尺寸后的车牌图像列表
-    - bboxes: 车牌的外接矩形列表 (x, y, w, h)
-    """
-    # 高斯滤波去噪
-    blurred = cv2.GaussianBlur(img, (5, 5), 0)
-    save_and_show('Blurred Image', blurred, f'{num}_blurred.png')
+    # 检查图像的横向分辨率，如果小于5000，则放大到5000，纵向等比放大
+    height, width = img.shape[:2]
+    if width < 5000:
+        scale_factor = 5000 / width
+        new_width = 5000
+        new_height = int(height * scale_factor)
+        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+        print(f"Image {img_name} resized to {new_width}x{new_height}")
 
-    # RGB转HSV
-    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    oriimg = img.copy()
+    save_image(img, output_folder, img_name, 'original')
 
-    # 默认颜色范围（蓝色、白色、黄色）
-    if color_ranges is None:
-        color_ranges = {
-            'blue': (np.array([100, 80, 80]), np.array([140, 255, 255])),
-            'white': (np.array([0, 0, 200]), np.array([180, 30, 255])),
-            'yellow': (np.array([20, 100, 100]), np.array([30, 255, 255]))
-        }
+    # 高斯模糊处理
+    img = cv2.GaussianBlur(img, (5, 5), 0)
+    save_image(img, output_folder, img_name, 'blurred')
 
-    # 构建多颜色掩模
-    masks = []
-    for color, (lower, upper) in color_ranges.items():
-        mask = cv2.inRange(hsv, lower, upper)
-        masks.append(mask)
+    # 转换为HSV颜色空间
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    save_image(hsv, output_folder, img_name, 'hsv')
 
-    # 合并所有颜色的掩模
-    combined_mask = functools.reduce(cv2.bitwise_or, masks)
-    save_and_show('Combined Mask', combined_mask, f'{num}_combined_mask.png')
+    lower = np.array([100, 100, 100])
+    upper = np.array([140, 255, 255])
+    # 创建掩膜，只保留蓝色部分
+    mask = cv2.inRange(hsv, lower, upper)
+    save_image(mask, output_folder, img_name, 'mask')
 
-    # 形态学操作，去除噪点
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
-    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    save_and_show('Mask after Morphology', combined_mask, f'{num}_mask_morphology.png')
-
-    # 检测轮廓
-    contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 查找轮廓
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     blocks = []
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
-        aspect_ratio = w / h
-        area = w * h
-
-        # 根据车牌的长宽比和面积筛选轮廓
-        if 2 < aspect_ratio < 6 and 500 < area < 50000:
-            blocks.append(c)  # 保存轮廓而不是边界框
+        if (w > (h * 2)) and (w < (h * 6)):
+            blocks.append([x, y, w, h, w * h])
 
     if not blocks:
-        print("未检测到车牌区域。")
-        return [], []
-
-    # 选择所有符合条件的车牌矩形
-    plates = []
-    for contour in blocks:
-        # 获取轮廓的四个顶点
-        epsilon = 0.02 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-
-        if len(approx) == 4:  # 只处理四边形轮廓
-            plates.append(approx)
-
-    # 截取所有车牌区域并调整尺寸
-    ROIs = []
-    bboxes = []
-    for idx, plate in enumerate(plates):
-        # 进行透视变换
-        pts = plate.reshape(4, 2)
-        rect = order_points(pts)
-        (tl, tr, br, bl) = rect
-
-        # 计算新的宽度和高度
-        widthA = np.linalg.norm(br - bl)
-        widthB = np.linalg.norm(tr - tl)
-        maxWidth = max(int(widthA), int(widthB))
-
-        heightA = np.linalg.norm(tr - br)
-        heightB = np.linalg.norm(tl - bl)
-        maxHeight = max(int(heightA), int(heightB))
-
-        dst = np.array([
-            [0, 0],
-            [maxWidth - 1, 0],
-            [maxWidth - 1, maxHeight - 1],
-            [0, maxHeight - 1]], dtype="float32")
-
-        try:
-            M = cv2.getPerspectiveTransform(rect, dst)
-            warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
-            ROIs.append(warped)
-            bboxes.append(plate)  # 保存原始顶点
-
-            # 保存每个车牌图像
-            cv2.imwrite(os.path.join(output_dir, f'{num}_plate_{idx}.png'), warped)
-        except Exception as e:
-            print(f"透视变换失败: {e}")
-            continue
-
-    return ROIs, bboxes
-
-def segment_characters(plate_img, num, templates=None):
-    """
-    分割车牌中的字符并进行识别。
-
-    参数:
-    - plate_img: 车牌图像
-    - num: 图像编号，用于保存文件
-    - templates: 字符模板字典
-
-    返回:
-    - refined_characters: 识别后的字符列表
-    - plate_text: 识别出的车牌文本
-    """
-    # Convert to grayscale
-    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-    save_and_show('Plate Gray', gray, f'{num}_plate_gray.png')
-
-    # Binarization
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY_INV)
-    save_and_show('Plate Binary', binary, f'{num}_plate_binary.png')
-
-    # Remove margins
-    margin_size = 10
-    binary[:margin_size, :] = 0
-    binary[-margin_size:, :] = 0
-    binary[:, :margin_size] = 0
-    binary[:, -margin_size:] = 0
-    save_and_show('Binary after Margin Removal', binary, f'{num}_binary_margin_removed.png')
-
-    # Morphological operations to clean up the image
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    save_and_show('Opening Image', opening, f'{num}_opening.png')
-
-    # Dilation to connect characters
-    dilated = cv2.dilate(opening, kernel, iterations=2)
-    save_and_show('Dilated Image', dilated, f'{num}_dilated.png')
-
-    # Connected components
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dilated, connectivity=8)
-
-    characters = []
-    char_img = plate_img.copy()
-
-    # Dynamic area threshold
-    plate_height, plate_width = plate_img.shape[:2]
-    min_area = plate_width * plate_height * 0.02
-    max_area = plate_width * plate_height * 0.06
-
-    for i in range(1, num_labels):
-        x, y, w, h, area = stats[i]
-        aspect_ratio = w / h
-        if min_area < area < max_area and 0.3 < aspect_ratio < 0.8:
-            cv2.rectangle(char_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            char = binary[y:y + h, x:x + w]
-            characters.append((x, char))
-            # 保存原始字符图像
-            cv2.imwrite(os.path.join(output_dir, f'{num}_char_{i}.png'), char)
-
-    save_and_show('Detected Characters', char_img, f'{num}_detected_characters.png')
-
-    if not characters:
-        print("未检测到字符。")
-        return [], ""
-
-    # Sort characters by x-coordinate
-    characters = sorted(characters, key=lambda item: item[0])
-    sorted_characters = [char for (_, char) in characters]
-
-    refined_characters = []
-    for i, char in enumerate(sorted_characters):
-        char_h, char_w = char.shape
-        if char_w > char_h:  # 检查是否有合并字符
-            sub_chars = vertical_projection_split(char, min_gap_ratio=0.5)
-            for j, sub_char in enumerate(sub_chars):
-                try:
-                    # 保存原始子字符图像
-                    cv2.imwrite(os.path.join(output_dir, f'{num}_char_split_{i}_{j}.png'), sub_char)
-                    # 调整大小用于识别
-                    sub_char_resized = cv2.resize(sub_char, (20, 40), interpolation=cv2.INTER_AREA)
-                    refined_characters.append(sub_char_resized)
-                except Exception as e:
-                    print(f"调整子字符大小时出错: {e}")
-        else:
-            try:
-                # 调整大小用于识别
-                char_resized = cv2.resize(char, (20, 40), interpolation=cv2.INTER_AREA)
-                refined_characters.append(char_resized)
-            except Exception as e:
-                print(f"调整字符大小时出错: {e}")
-
-    save_and_show('Refined Characters', char_img, f'{num}_refined_characters.png')
-
-    # Character recognition
-    plate_text = ""
-    if templates:
-        for idx, char in enumerate(refined_characters):
-            recognized_char = recognize_character(char, templates)
-            plate_text += recognized_char if recognized_char else '?'
-            # 在车牌图像上标注识别出的字符
-            cv2.putText(char_img, recognized_char if recognized_char else '?', (10, 30 + idx * 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-    # 保存和显示识别结果
-    cv2.imwrite(os.path.join(output_dir, f'{num}_recognized_plate.png'), char_img)
-    save_and_show('Recognized Plate Text', char_img, f'{num}_recognized_plate.png')
-
-    return refined_characters, plate_text
-
-def main():
-    """
-    主函数，进行车牌识别。
-    """
-    input_dir = r"F:\license_plate_recognition\license_plate_test"        # 替换为您的输入图片文件夹路径
-    template_dir = r"F:\license_plate_recognition\template_source"          # 替换为您的字符模板文件夹路径
-
-    # 加载字符模板
-    templates = load_char_templates(template_dir)
-    if not templates:
-        print("未加载到任何字符模板。请准备字符模板后重试。")
+        print(f"No license plate detected in {img_path}")
         return
 
-    # 获取文件夹中的所有图像文件
-    supported_formats = ('.png', '.jpg', '.jpeg', '.bmp')
-    image_files = [f for f in os.listdir(input_dir) if f.lower().endswith(supported_formats)]
+    # 找到面积最大的矩形，假设为车牌
+    max_rec = max(blocks, key=lambda a: a[4])
+    cv2.rectangle(oriimg, (max_rec[0], max_rec[1]), (max_rec[0] + max_rec[2], max_rec[1] + max_rec[3]), (255, 0, 255), 2)
+    save_image(oriimg, output_folder, img_name, 'detected_plate')
 
-    if not image_files:
-        print("输入文件夹中没有支持的图片格式。")
-        return
+    # 提取车牌区域
+    ROI = oriimg[max_rec[1]:max_rec[1] + max_rec[3], max_rec[0]:max_rec[0] + max_rec[2], :]
+    save_image(ROI, output_folder, img_name, 'ROI')
 
-    results = []
+    ROI_gray = cv2.cvtColor(ROI, cv2.COLOR_BGR2GRAY)
+    save_image(ROI_gray, output_folder, img_name, 'ROI_gray')
 
-    for image_file in image_files:
-        img_path = os.path.join(input_dir, image_file)
-        print(f"正在处理图片: {image_file}")
+    ret, threshold = cv2.threshold(ROI_gray, 0, 255, cv2.THRESH_OTSU)
+    save_image(threshold, output_folder, img_name, 'threshold')
 
-        # 确保文件路径的编码正确
-        img_path = os.path.abspath(img_path)
+    # 清除边缘
+    margin_size = 5
+    threshold[0:margin_size, :] = 0
+    threshold[-margin_size:, :] = 0
+    threshold[:, 0:margin_size] = 0
+    threshold[:, -margin_size:] = 0
+    save_image(threshold, output_folder, img_name, 'threshold_cleared')
 
-        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        if img is None:
-            print(f"无法读取图像 {img_path}，跳过。")
-            continue
+    # 膨胀和腐蚀操作
+    kernel1 = np.ones((1, 3), dtype=np.uint8)
+    dilate = cv2.dilate(threshold, kernel1, 1)
+    save_image(dilate, output_folder, img_name, 'dilate1')
 
-        # 检测车牌
-        ROIs, bboxes = detect_license_plate(img, image_file)
-        if not ROIs:
-            results.append((image_file, "未检测到车牌区域"))
-            continue
+    kernel2 = np.ones((7, 1), dtype=np.uint8)
+    dilate = cv2.dilate(dilate, kernel2, 1)
+    save_image(dilate, output_folder, img_name, 'dilate2')
 
-        for idx, (ROI, bbox) in enumerate(zip(ROIs, bboxes)):
-            # 可选：车牌透视变换校正（如有需要）
-            # ROI = correct_perspective(ROI, bbox)
+    erose = cv2.erode(dilate, kernel2, 3)
+    save_image(erose, output_folder, img_name, 'erose1')
 
-            characters, plate_text = segment_characters(ROI, f"{image_file}_{idx}", templates=templates)
-            if not characters:
-                results.append((f"{image_file}_{idx}", "未检测到字符"))
-                continue
+    # 清除边缘
+    margin_width = int(0.001 * width)  # 根据横向像素长度的3%
+    margin_height = int(0.03 * height)  # 根据纵向像素长度的3%
 
-            # 将识别结果保存到列表中
-            results.append((f"{image_file}_{idx}", plate_text))
+    erose[0:margin_height, :] = 0  # 上边
+    erose[-margin_height:, :] = 0  # 下边
+    erose[:, 0:margin_width] = 0  # 左边
+    erose[:, -margin_width:] = 0  # 右边
+    save_image(erose, output_folder, img_name, 'erose_cleared')
 
-        # 等待按键以查看结果
-        cv2.waitKey(0)
+    erose2 = cv2.erode(erose, kernel2, 3)
+    save_image(erose2, output_folder, img_name, 'erose2')
 
-    cv2.destroyAllWindows()
+    # 连通组件分析
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(erose, connectivity=4)
+    word_rect = []
+    for r in stats:
+        x, y, w, h, s = r.tolist()
+        if w * 1.5 < h and w * 10 > h and h > threshold.shape[0] / 2:
+            word_rect.append(r)
+            cv2.rectangle(ROI, (x, y), (x + w, y + h), (255, 0, 255), 2)
 
-    # 打印识别结果
-    for image_file, result in results:
-        print(f"{image_file}: {result}")
+    # 按照 x 坐标对字符区域进行排序
+    word_rect.sort(key=lambda r: r[0])
 
-    # 可选：将结果保存到文件
-    with open('识别结果.txt', 'w', encoding='utf-8') as f:
-        for image_file, result in results:
-            f.write(f"{image_file}: {result}\n")
+    save_image(ROI, output_folder, img_name, 'detected_characters')
+
+    recognized_text = ""
+    for rect in word_rect:
+        x, y, w, h, s = rect
+        char_img = ROI[y:y + h, x:x + w]
+        preprocessed_char = preprocess_character(char_img)
+        label = match_character(preprocessed_char, templates)
+        if label:
+            recognized_text += label
+            cv2.putText(ROI, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    save_image(ROI, output_folder, img_name, 'final_recognition')
+
+    # 将识别结果保存到文件
+    with open(os.path.join(output_folder, f"{img_name}_result.txt"), 'w') as f:
+        f.write(f"Recognized Text: {recognized_text}")
+
+    print(f"Recognized Text in {img_path}: {recognized_text}")
 
 if __name__ == '__main__':
-    main()
+    folder_path = r'F:\license_plate_recognition\license_plate_test'  # 替换为你的文件夹路径
+    template_folder = r'F:\license_plate_recognition\template_source'  # 替换为你的模板文件夹路径
+    output_folder = r'F:\license_plate_recognition\output'  # 替换为你的输出文件夹路径
+
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    templates = load_templates(template_folder)
+    for filename in os.listdir(folder_path):
+        if filename.endswith('.png'):
+            img_path = os.path.join(folder_path, filename)
+            process_image(img_path, templates, output_folder)
